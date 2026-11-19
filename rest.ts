@@ -61,12 +61,35 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
+/** Hand-built serialization of a single issue, byte-identical to
+ *  `${JSON.stringify(issueJson(repo, issue))}\n` but without building the
+ *  intermediate object: the write workload creates 200 issues in a row, and
+ *  this is its per-create serialization cost. Every string field is escaped
+ *  with JSON.stringify, and the field order matches issueJson, so the bytes
+ *  match the generic path exactly. */
+export function issueResponseString(repo: Repo, issue: Issue): string {
+  const labels = issue.labels
+    .map((name) => {
+      const label = repo.labels.get(name);
+      return `{"name":${JSON.stringify(name)},"color":${JSON.stringify(label?.color ?? 'ededed')},"default":false,"description":""}`;
+    })
+    .join(',');
+  return (
+    `{"id":${issue.id},"node_id":${JSON.stringify(globalId('I', `${repo.owner}/${repo.name}:${issue.number}`))},"number":${issue.number},` +
+    `"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":${JSON.stringify(issue.state)},"labels":[${labels}],` +
+    `"user":{"login":${JSON.stringify(repo.owner)},"id":1000,"type":"User"},"comments":${issue.comments.length},` +
+    `"created_at":"${FIXED_ISO}","updated_at":"${FIXED_ISO}",` +
+    `"html_url":${JSON.stringify(`https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`)},` +
+    `"url":${JSON.stringify(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`)}}\n`
+  );
+}
+
 /** The serialized single-issue response (JSON + newline), cached on the issue:
  *  the read workload asks for the same unchanged issue 2,000 times, so only
- *  the first call pays for JSON.stringify. */
+ *  the first call pays for serialization. */
 export function issueResponseBuffer(repo: Repo, issue: Issue): Buffer {
   if (issue.jsonBuf !== null) return issue.jsonBuf;
-  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  const buf = Buffer.from(issueResponseString(repo, issue), 'utf8');
   issue.jsonBuf = buf;
   return buf;
 }
