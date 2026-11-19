@@ -602,6 +602,7 @@ function resolveMutation(ctx: GqlContext, name: string, args: Record<string, unk
       state: 'open',
       labels: [],
       comments: [],
+      jsonBuf: null,
     };
     ctx.store.nextIssueId += 1;
     repo.issues.set(number, issue);
@@ -616,6 +617,7 @@ function resolveMutation(ctx: GqlContext, name: string, args: Record<string, unk
     const issue = repo?.issues.get(Number(numberText));
     if (issue === undefined) throw new FieldError('closeIssue: unknown issue');
     issue.state = 'closed';
+    issue.jsonBuf = null;
     return wrap('CloseIssuePayload', { issue: issueNode(ctx.store, repo as Repo, issue) });
   }
   if (name === 'createPullRequest') {
@@ -674,6 +676,7 @@ function resolveMutation(ctx: GqlContext, name: string, args: Record<string, unk
     const comment = { id: ctx.store.nextCommentId, body: String(input.body ?? '') };
     ctx.store.nextCommentId += 1;
     issue.comments.push(comment);
+    issue.jsonBuf = null;
     return wrap('AddCommentPayload', {
       commentEdge: wrap('CommentEdge', {
         node: wrap('Comment', { id: globalId('C', `${repo?.owner}/${repo?.name}:${issue.number}:${comment.id}`), body: comment.body }),

@@ -12,6 +12,11 @@ export interface RestResult {
   headers?: Record<string, string>;
 }
 
+/** The fixed creation timestamp every repository, issue and pull request
+ *  carries (2025-01-01T00:00:00Z): precomputed once instead of building a
+ *  Date and formatting it per object. */
+const FIXED_ISO = '2025-01-01T00:00:00.000Z';
+
 const ok = (status: number, body: unknown, headers?: Record<string, string>): RestResult => ({ status, body, headers });
 const err = (status: number, message: string): RestResult => ({ status, body: { message } });
 
@@ -27,8 +32,8 @@ export function repoJson(repo: Repo): Record<string, unknown> {
     default_branch: repo.defaultBranch,
     html_url: `https://github.com/${repo.owner}/${repo.name}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}`,
-    created_at: isoTime(1735689600),
-    updated_at: isoTime(1735689600),
+    created_at: FIXED_ISO,
+    updated_at: FIXED_ISO,
     has_issues: true,
     has_projects: true,
     has_wiki: true,
@@ -49,11 +54,21 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     }),
     user: { login: repo.owner, id: 1000, type: 'User' },
     comments: issue.comments.length,
-    created_at: isoTime(1735689600),
-    updated_at: isoTime(1735689600),
+    created_at: FIXED_ISO,
+    updated_at: FIXED_ISO,
     html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+/** The serialized single-issue response (JSON + newline), cached on the issue:
+ *  the read workload asks for the same unchanged issue 2,000 times, so only
+ *  the first call pays for JSON.stringify. */
+export function issueResponseBuffer(repo: Repo, issue: Issue): Buffer {
+  if (issue.jsonBuf !== null) return issue.jsonBuf;
+  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issue.jsonBuf = buf;
+  return buf;
 }
 
 export function pullJson(store: Store, repo: Repo, pr: PullRequest): Record<string, unknown> {
@@ -71,8 +86,8 @@ export function pullJson(store: Store, repo: Repo, pr: PullRequest): Record<stri
     merge_commit_sha: pr.mergeCommitSha,
     mergeable: pr.state === 'open' ? store.mergeable(repo, pr) === 'MERGEABLE' : null,
     user: { login: repo.owner, id: 1000, type: 'User' },
-    created_at: isoTime(1735689600),
-    updated_at: isoTime(1735689600),
+    created_at: FIXED_ISO,
+    updated_at: FIXED_ISO,
     html_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pr.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pr.number}`,
   };
@@ -275,6 +290,8 @@ function handleRepoSub(
       if (name === '') return err(422, 'name is required');
       const color = typeof body?.color === 'string' ? (body.color as string) : 'ededed';
       repo.labels.set(name, { name, color });
+      // Label colors are embedded in cached issue responses.
+      for (const issue of repo.issues.values()) issue.jsonBuf = null;
       return ok(201, { name, color, default: false, description: '' });
     }
     return null;
@@ -308,7 +325,7 @@ function handleContents(
   query: URLSearchParams,
   body: Record<string, unknown> | null,
 ): RestResult | null {
-  const decodedPath = path.split('/').map((part) => decodeURIComponent(part)).join('/');
+  const decodedPath = path.split('/').map((part) => (part.includes('%') ? decodeURIComponent(part) : part)).join('/');
   if (method === 'GET') {
     const tip = resolveRefTip(ctx.store, repo, query.get('ref'));
     if (tip === undefined) return err(404, 'Not Found');
@@ -456,10 +473,11 @@ function handleIssues(
         state: 'open',
         labels: labelNames,
         comments: [],
+        jsonBuf: null,
       };
       ctx.store.nextIssueId += 1;
       repo.issues.set(number, issue);
-      return ok(201, issueJson(repo, issue));
+      return ok(201, issueResponseBuffer(repo, issue));
     }
     return null;
   }
@@ -468,12 +486,13 @@ function handleIssues(
   const issue = repo.issues.get(number);
   if (rest.length === 1) {
     if (issue === undefined) return err(404, 'Not Found');
-    if (method === 'GET') return ok(200, issueJson(repo, issue));
+    if (method === 'GET') return ok(200, issueResponseBuffer(repo, issue));
     if (method === 'PATCH') {
+      issue.jsonBuf = null;
       if (body?.state === 'open' || body?.state === 'closed') issue.state = body.state;
       if (typeof body?.title === 'string') issue.title = body.title as string;
       if (typeof body?.body === 'string') issue.body = body.body as string;
-      return ok(200, issueJson(repo, issue));
+      return ok(200, issueResponseBuffer(repo, issue));
     }
     return null;
   }
@@ -490,6 +509,7 @@ function handleIssues(
       const comment = { id: ctx.store.nextCommentId, body: commentBody };
       ctx.store.nextCommentId += 1;
       issue.comments.push(comment);
+      issue.jsonBuf = null; // the comments count in the cached response changed
       return ok(201, { id: comment.id, body: comment.body, user: { login: repo.owner } });
     }
   }

@@ -27,6 +27,11 @@ export interface Issue {
   state: 'open' | 'closed';
   labels: string[];
   comments: Comment[];
+  /** Memoized serialized single-issue REST response (JSON + newline), or null
+   *  when it has never been served or was invalidated by a mutation (PATCH,
+   *  comment, close, label change). The issue's fields never change without
+   *  one of those paths clearing this, so a cached buffer is always current. */
+  jsonBuf: Buffer | null;
 }
 
 export interface Comment {
@@ -62,6 +67,14 @@ export interface Repo {
   labels: Map<string, { name: string; color: string }>;
   nextNumber: number; // shared issue/PR numbering, per repo
   commitSeq: number; // deterministic timestamp offset for server-made commits
+  /** Memoized git responses. A fetch response is a pure function of its
+   *  (wants, haves, depth, shallow) arguments over immutable objects, so it
+   *  stays valid as the repo grows; advertisements and ls-refs are keyed by a
+   *  fingerprint of the refs, which changes whenever a ref moves. Caches hold
+   *  bytes only — they never change an answer, only how fast it is served.
+   *  Capped so a long trial cannot grow them without bound. */
+  fetchCache: Map<string, Buffer>;
+  refsCache: Map<string, Buffer>;
 }
 
 export class Store {
@@ -93,6 +106,8 @@ export class Store {
       labels: new Map(),
       nextNumber: 1,
       commitSeq: 0,
+      fetchCache: new Map(),
+      refsCache: new Map(),
     };
     this.nextRepoId += 1;
     this.repos.set(this.key(owner, name), repo);
@@ -192,11 +207,29 @@ export class Store {
     return out;
   }
 
-  /** Is `ancestor` an ancestor of (or equal to) `descendant`? */
+  /** Is `ancestor` an ancestor of (or equal to) `descendant`? Walks the parent
+   *  graph and stops the moment it finds the ancestor: a push's fast-forward
+   *  check is usually one step (the new commit's parent), so there is no need
+   *  to enumerate the whole history the way reachableCommits does. */
   isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
     if (ancestor === descendant) return true;
     if (ancestor === ZERO_OID) return true;
-    return this.reachableCommits(repo, [descendant]).has(ancestor);
+    const start = this.peelToCommit(repo, descendant);
+    if (start === undefined) return false;
+    const seen = new Set<string>();
+    const stack: string[] = [start];
+    while (stack.length > 0) {
+      const oid = stack.pop() as string;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const object = repo.objects.get(oid);
+      if (object === undefined || object.type !== 'commit') continue;
+      for (const parent of parseCommit(object.data).parents) {
+        if (parent === ancestor) return true;
+        stack.push(parent);
+      }
+    }
+    return false;
   }
 
   /** The newest common ancestor of two commits, or null. */

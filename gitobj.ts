@@ -42,6 +42,19 @@ export interface CommitInfo {
 }
 
 export function parseCommit(data: Buffer): CommitInfo {
+  const cached = commitParseCache.get(data);
+  if (cached !== undefined) return cached;
+  const info = parseCommitUncached(data);
+  commitParseCache.set(data, info);
+  return info;
+}
+
+/** Objects are immutable once stored, so parsed forms are safe to cache by buffer. */
+const commitParseCache = new WeakMap<Buffer, CommitInfo>();
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
+const tagParseCache = new WeakMap<Buffer, TagInfo>();
+
+function parseCommitUncached(data: Buffer): CommitInfo {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
   const header = split < 0 ? text : text.slice(0, split);
@@ -95,6 +108,14 @@ export interface TreeEntry {
 
 /** Parse a tree object's binary entries. */
 export function parseTree(data: Buffer): TreeEntry[] {
+  const cached = treeParseCache.get(data);
+  if (cached !== undefined) return cached;
+  const entries = parseTreeUncached(data);
+  treeParseCache.set(data, entries);
+  return entries;
+}
+
+function parseTreeUncached(data: Buffer): TreeEntry[] {
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -133,6 +154,14 @@ export interface TagInfo {
 }
 
 export function parseTag(data: Buffer): TagInfo {
+  const cached = tagParseCache.get(data);
+  if (cached !== undefined) return cached;
+  const info = parseTagUncached(data);
+  tagParseCache.set(data, info);
+  return info;
+}
+
+function parseTagUncached(data: Buffer): TagInfo {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
   const header = split < 0 ? text : text.slice(0, split);
@@ -305,25 +334,17 @@ interface PackEntry {
 
 /** Read one zlib stream starting at `offset`; returns the data and bytes consumed. */
 function inflateAt(buffer: Buffer, offset: number): { data: Buffer; consumed: number } {
-  // inflateSync ignores trailing bytes and throws on truncation, so the smallest
-  // length that inflates is the stream's true length.
-  let low = 1;
-  let high = buffer.length - offset;
-  let found = -1;
-  let foundData: Buffer | null = null;
-  while (low <= high) {
-    const mid = (low + high) >> 1;
-    try {
-      const data = zlibInflate(buffer.subarray(offset, offset + mid));
-      found = mid;
-      foundData = data;
-      high = mid - 1;
-    } catch {
-      low = mid + 1;
-    }
-  }
-  if (found < 0 || foundData === null) throw new Error('zlib stream does not terminate');
-  return { data: foundData, consumed: found };
+  // One inflate: inflateSync ignores trailing bytes, and with {info: true} the
+  // engine reports exactly how many input bytes the stream consumed, so no
+  // binary search over the length is needed. (The old code retried inflateSync
+  // ~log2(n) times per object, and every failed attempt built an Error with a
+  // stack trace — the profile showed error construction alone cost ~10% of
+  // push CPU.) A truncated stream still throws, as before.
+  const result = zlibInflate(buffer.subarray(offset), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
+  };
+  return { data: result.buffer, consumed: result.engine.bytesWritten };
 }
 
 function readVarint(buffer: Buffer, offset: number): { value: number; next: number } {

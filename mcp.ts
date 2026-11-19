@@ -171,6 +171,7 @@ function callTool(store: Store, login: string, name: string, args: Record<string
         state: 'open' as const,
         labels: [] as string[],
         comments: [] as never[],
+        jsonBuf: null,
       };
       store.nextIssueId += 1;
       repo.issues.set(number, issue);

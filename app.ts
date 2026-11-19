@@ -26,6 +26,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
     res.end();
     return;
   }
+  if (Buffer.isBuffer(body)) {
+    // A pre-serialized response (the cached single-issue body): skip
+    // JSON.stringify and the byte-length scan entirely.
+    res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': body.length, 'x-github-request-id': nextRequestId(), ...headers });
+    res.end(body);
+    return;
+  }
   const text = `${JSON.stringify(body)}\n`;
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': nextRequestId(), ...headers });
   res.end(text);
@@ -47,9 +54,9 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 function bearerToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
-  if (typeof header !== 'string') return null;
-  const match = /^Bearer\s+(.+)$/.exec(header);
-  return match === null ? null : (match[1] as string);
+  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return null;
+  const token = header.slice('Bearer '.length);
+  return token === '' ? null : token;
 }
 
 function parseJsonBody(raw: Buffer): { ok: true; value: unknown } | { ok: false } {
@@ -62,19 +69,13 @@ function parseJsonBody(raw: Buffer): { ok: true; value: unknown } | { ok: false 
   }
 }
 
-function pathOf(req: IncomingMessage): string {
+/** The path and query of a request URL, parsed once per request. */
+function parseUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    const url = new URL(req.url ?? '/', 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return '/';
-  }
-}
-
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 
@@ -87,9 +88,8 @@ function baseUrlOf(req: IncomingMessage): string {
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
-      const path = pathOf(req);
+      const { path, query } = parseUrl(req);
       const method = req.method ?? 'GET';
-      const query = queryOf(req);
       const token = bearerToken(req);
       const login = VIEWER_LOGIN;
 

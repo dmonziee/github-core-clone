@@ -39,8 +39,27 @@ function peeledOf(store: Store, repo: Repo, oid: string): string | undefined {
   return store.peelToCommit(repo, oid);
 }
 
+/** A fingerprint of the repo's refs: changes whenever any ref moves, so a
+ *  cached advertisement or ls-refs answer keyed by it can never go stale. */
+function refsFingerprint(repo: Repo): string {
+  const parts: string[] = [];
+  for (const [name, oid] of repo.refs) parts.push(`${name}=${oid}`);
+  parts.sort();
+  return parts.join(',');
+}
+
+/** Store a memoized response, bounding the cache so a long trial cannot grow it. */
+function cachePut(cache: Map<string, Buffer>, key: string, value: Buffer): Buffer {
+  if (cache.size >= 128) cache.clear();
+  cache.set(key, value);
+  return value;
+}
+
 /** v0 advertisement body for one service, with the `# service=` preamble. */
 export function v0Advertisement(store: Store, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const key = `${service}\n${refsFingerprint(repo)}`;
+  const cached = repo.refsCache.get(key);
+  if (cached !== undefined) return cached;
   const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_CAPS;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const refs = sortedRefs(repo);
@@ -58,21 +77,24 @@ export function v0Advertisement(store: Store, repo: Repo, service: 'git-upload-p
     }
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return cachePut(repo.refsCache, key, Buffer.concat(parts));
 }
 
-/** v2 capability advertisement body for upload-pack, with the preamble. */
+/** v2 capability advertisement body for upload-pack, with the preamble.
+ *  Fully constant: one buffer is built once and served for every request. */
+const V2_ADVERTISEMENT_BODY: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 export function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow filter\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  return V2_ADVERTISEMENT_BODY;
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +273,9 @@ function handleLsRefs(store: Store, repo: Repo, lines: string[]): Buffer {
     else if (line === 'unborn') unborn = true;
     else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
   }
+  const cacheKey = `ls-refs\n${refsFingerprint(repo)}\n${repo.defaultBranch}\n${peel ? 'p' : ''}${symrefs ? 's' : ''}${unborn ? 'u' : ''}\n${prefixes.join(',')}`;
+  const cached = repo.refsCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const parts: Buffer[] = [];
   const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
   const refs = sortedRefs(repo);
@@ -260,7 +285,7 @@ function handleLsRefs(store: Store, repo: Repo, lines: string[]): Buffer {
   // existing branch (it would then try to read that branch's tree).
   if (refs.length === 0) {
     parts.push(PKT_FLUSH);
-    return Buffer.concat(parts);
+    return cachePut(repo.refsCache, cacheKey, Buffer.concat(parts));
   }
   // HEAD is subject to the same prefix filter as any ref: git's clone
   // asks for `ref-prefix HEAD` alongside `refs/heads/` and `refs/tags/`.
@@ -281,11 +306,26 @@ function handleLsRefs(store: Store, repo: Repo, lines: string[]): Buffer {
       parts.push(pktLine(`${line}\n`));
     }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return cachePut(repo.refsCache, cacheKey, Buffer.concat(parts));
+}
+
+/**
+ * The cache key for a fetch response. The response is a pure function of
+ * these arguments over immutable objects (a commit's parents and trees are
+ * fixed at creation), so the same key always means the same bytes, however
+ * the repo has grown since. The protocol version is part of the key because
+ * v0 and v2 frame the same pack differently.
+ */
+function fetchCacheKey(version: 'v0' | 'v2', args: FetchArgs): string {
+  const sorted = (values: readonly string[]): string => [...values].sort().join(',');
+  return `${version}|w:${sorted(args.wants)}|h:${sorted(args.haves)}|d:${args.depth ?? ''}|s:${sorted(args.shallow)}`;
 }
 
 function handleFetchV2(repo: Repo, lines: string[], store: Store): Buffer {
   const args = parseFetchArgs(lines);
+  const key = fetchCacheKey('v2', args);
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
   const plan = planFetch(store, repo, args.wants, args.haves, args.depth, args.shallow);
   const pack = writePack([...plan.objects.values()]);
   const parts: Buffer[] = [];
@@ -305,11 +345,14 @@ function handleFetchV2(repo: Repo, lines: string[], store: Store): Buffer {
   parts.push(pktLine('packfile\n'));
   parts.push(sidebandPack(pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return cachePut(repo.fetchCache, key, Buffer.concat(parts));
 }
 
 function handleUploadPackV0(repo: Repo, lines: string[], store: Store): Buffer {
   const args = parseFetchArgs(lines);
+  const key = fetchCacheKey('v0', args);
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
   const plan = planFetch(store, repo, args.wants, args.haves, args.depth, args.shallow);
   const pack = writePack([...plan.objects.values()]);
   const parts: Buffer[] = [pktLine('NAK\n')];
@@ -317,7 +360,7 @@ function handleUploadPackV0(repo: Repo, lines: string[], store: Store): Buffer {
   for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   parts.push(sidebandPack(pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return cachePut(repo.fetchCache, key, Buffer.concat(parts));
 }
 
 // ---------------------------------------------------------------------------
